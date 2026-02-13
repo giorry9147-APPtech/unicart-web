@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
-import { adminAuth, adminDb } from "@/lib/firebaseAdmin";
 import crypto from "crypto";
+import { adminAuth, adminDb } from "@/lib/firebaseAdmin";
+import * as admin from "firebase-admin";
 
 function getDomain(u: string) {
   try {
@@ -12,52 +13,43 @@ function getDomain(u: string) {
 
 export async function POST(req: Request) {
   try {
-    // 1) Auth
     const authHeader = req.headers.get("authorization") || "";
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-
     if (!token) {
       return NextResponse.json({ ok: false, error: "Missing token" }, { status: 401 });
     }
 
-    const decoded = await adminAuth.verifyIdToken(token);
+    const decoded = await adminAuth().verifyIdToken(token);
     const uid = decoded.uid;
 
-    // 2) Input
     const body = await req.json();
     const url = String(body?.url || "").trim();
     const source = String(body?.source || "app_manual").trim();
 
-    if (!url) {
-      return NextResponse.json({ ok: false, error: "Missing url" }, { status: 400 });
-    }
+    if (!url) return NextResponse.json({ ok: false, error: "Missing url" }, { status: 400 });
 
     const domain = getDomain(url);
-    if (!domain) {
-      return NextResponse.json({ ok: false, error: "Invalid url" }, { status: 400 });
-    }
+    if (!domain) return NextResponse.json({ ok: false, error: "Invalid url" }, { status: 400 });
 
-    // 3) Create item
-    const now = Date.now();
     const itemId = crypto.randomUUID();
 
+    // ✅ schrijf velden die jouw wishlist.tsx verwacht
     const item = {
       id: itemId,
-      url,
-      domain,
-      shop: domain,
-      title: body?.title ?? null,
-      image: body?.image ?? null,
+      title: body?.title ?? domain,       // voorlopig domain als fallback
       price: typeof body?.price === "number" ? body.price : null,
-      currency: body?.currency ?? null,
+      shop: body?.shop ?? domain,
+      product_url: url,
+      image_url: body?.image_url ?? "",
+      status: "todo",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      domain,
+      category: body?.category ?? "other",
       source, // app_manual | mobile_share | extension
-      createdAt: now,
-      updatedAt: now,
-      enrichStatus: "pending", // later
     };
 
-    // 4) Save
-    await adminDb
+    await adminDb()
       .collection("users")
       .doc(uid)
       .collection("wishlist_items")
@@ -66,9 +58,6 @@ export async function POST(req: Request) {
 
     return NextResponse.json({ ok: true, itemId });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: e?.message || "Server error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: e?.message || "Server error" }, { status: 500 });
   }
 }
