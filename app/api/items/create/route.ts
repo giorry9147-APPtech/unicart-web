@@ -1,3 +1,4 @@
+// unicart-web/app/api/items/create/route.ts
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { adminAuth, adminDb } from "@/lib/firebaseAdmin";
@@ -11,8 +12,20 @@ function getDomain(u: string) {
   }
 }
 
+function toNumberOrNull(v: any): number | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+
+  const s = String(v).trim();
+  if (!s) return null;
+
+  const num = Number(s.replace(",", "."));
+  return Number.isFinite(num) ? num : null;
+}
+
 export async function POST(req: Request) {
   try {
+    // 1) Auth
     const authHeader = req.headers.get("authorization") || "";
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
     if (!token) {
@@ -22,31 +35,48 @@ export async function POST(req: Request) {
     const decoded = await adminAuth().verifyIdToken(token);
     const uid = decoded.uid;
 
+    // 2) Input
     const body = await req.json();
     const url = String(body?.url || "").trim();
-    const source = String(body?.source || "app_manual").trim();
+    const source = String(body?.source || "app_manual").trim(); // app_manual | mobile_share | extension
 
-    if (!url) return NextResponse.json({ ok: false, error: "Missing url" }, { status: 400 });
+    if (!url) {
+      return NextResponse.json({ ok: false, error: "Missing url" }, { status: 400 });
+    }
 
     const domain = getDomain(url);
-    if (!domain) return NextResponse.json({ ok: false, error: "Invalid url" }, { status: 400 });
+    if (!domain) {
+      return NextResponse.json({ ok: false, error: "Invalid url" }, { status: 400 });
+    }
 
     const itemId = crypto.randomUUID();
 
-    // ✅ schrijf velden die jouw wishlist.tsx verwacht
-    const item = {
+    // Optional fields (from app/share/extension)
+    const titleIn = String(body?.title || "").trim();
+    const shopIn = String(body?.shop || "").trim();
+    const imageIn = String(body?.image_url || "").trim();
+    const categoryIn = String(body?.category || "").trim();
+    const priceIn = toNumberOrNull(body?.price);
+
+    // 3) Minimal item that matches wishlist.tsx fields
+    const item: any = {
       id: itemId,
-      title: body?.title ?? domain,       // voorlopig domain als fallback
-      price: typeof body?.price === "number" ? body.price : null,
-      shop: body?.shop ?? domain,
+      title: titleIn || domain,
+      price: priceIn,
+      shop: shopIn || domain,
       product_url: url,
-      image_url: body?.image_url ?? "",
+      image_url: imageIn || "",
       status: "todo",
+      targetPrice: null,
+      virtualSaved: 0,
+
+      domain,
+      category: categoryIn || "other",
+      source,
+
+      enrichStatus: "pending",
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      domain,
-      category: body?.category ?? "other",
-      source, // app_manual | mobile_share | extension
     };
 
     await adminDb()
@@ -56,8 +86,26 @@ export async function POST(req: Request) {
       .doc(itemId)
       .set(item, { merge: true });
 
+    // 4) Fire-and-forget enrichment (do not await)
+    const baseUrl = process.env.BASE_URL || "https://unicart-web.vercel.app";
+    const enrichSecret = process.env.ENRICH_SECRET || "";
+
+    fetch(`${baseUrl}/api/items/enrich`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-enrich-secret": enrichSecret,
+      },
+      body: JSON.stringify({ uid, itemId, url }),
+    }).catch(() => {
+      // silent fail (best-effort)
+    });
+
     return NextResponse.json({ ok: true, itemId });
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: e?.message || "Server error" }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: e?.message || "Server error" },
+      { status: 500 }
+    );
   }
 }
