@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { adminAuth, adminDb } from "@/lib/firebaseAdmin";
 import * as admin from "firebase-admin";
+import { parseProductUrl } from "@/lib/scraper/parseProduct";
 
 export async function POST(req: Request) {
   try {
@@ -15,7 +16,7 @@ export async function POST(req: Request) {
     const uid = decoded.uid;
 
     // 2) Input
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
     const itemId = String(body?.itemId || "").trim();
     if (!itemId) {
       return NextResponse.json({ ok: false, error: "Missing itemId" }, { status: 400 });
@@ -34,12 +35,14 @@ export async function POST(req: Request) {
     }
 
     const data = snap.data() as any;
-    const url = String(data?.product_url || "").trim();
+
+    // support both fields just in case you have mixed data
+    const url = String(data?.product_url || data?.url || "").trim();
     if (!url) {
       return NextResponse.json({ ok: false, error: "Item has no product_url" }, { status: 400 });
     }
 
-    // 4) Set pending immediately (UX)
+    // 4) Mark pending (UX)
     await ref.set(
       {
         enrichStatus: "pending",
@@ -49,20 +52,55 @@ export async function POST(req: Request) {
       { merge: true }
     );
 
-    // 5) Fire-and-forget internal enrich
-    const baseUrl = process.env.BASE_URL || "https://unicart-web.vercel.app";
-    const enrichSecret = process.env.ENRICH_SECRET || "";
+    // 5) Parse now (tiered: html -> playwright via env)
+    const debug = process.env.SCRAPE_DEBUG === "1";
+    const scraperServiceUrl = process.env.SCRAPER_SERVICE_URL || undefined;
+    const scraperToken = process.env.SCRAPER_TOKEN || undefined;
 
-    fetch(`${baseUrl}/api/items/enrich`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-enrich-secret": enrichSecret,
+    const parsed = await parseProductUrl(url, {
+      debug,
+      scraperServiceUrl,
+      scraperToken,
+    });
+
+    if (!parsed.ok) {
+      await ref.set(
+        {
+          enrichStatus: "failed",
+          enrichError: parsed.error,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      return NextResponse.json(parsed, { status: 502 });
+    }
+
+    // 6) Write back to Firestore (map to your schema)
+    await ref.set(
+      {
+        // keep your url field stable
+        product_url: url,
+
+        // fields your UI likely reads
+        title: parsed.title || data?.title || "",
+        imageUrl: parsed.imageUrl || data?.imageUrl || "",
+        price: parsed.price ?? data?.price ?? null,
+        currency: parsed.currency ?? data?.currency ?? null,
+
+        // status/meta
+        enrichStatus: "success",
+        enrichError: admin.firestore.FieldValue.delete(),
+        parseSource: parsed.source,
+        parseConfidence: parsed.confidence,
+        parseWarnings: parsed.warnings ?? [],
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastRefreshedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
-      body: JSON.stringify({ uid, itemId, url }),
-    }).catch(() => {});
+      { merge: true }
+    );
 
-    return NextResponse.json({ ok: true });
+    return NextResponse.json({ ok: true, itemId, parsed });
   } catch (e: any) {
     return NextResponse.json(
       { ok: false, error: e?.message || "Server error" },
