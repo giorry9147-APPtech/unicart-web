@@ -1,3 +1,4 @@
+// unicart-web/app/api/items/enrich/route.ts
 import { NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebaseAdmin";
 import * as admin from "firebase-admin";
@@ -11,6 +12,8 @@ type Parsed = {
   shop?: string;
   domain?: string;
 };
+
+type EnrichStatus = "pending" | "ok" | "failed";
 
 function getDomain(u: string) {
   try {
@@ -37,6 +40,14 @@ function pickFirst(...vals: Array<string | undefined | null>) {
   return "";
 }
 
+function isEmpty(v: any) {
+  return (
+    v === null ||
+    v === undefined ||
+    (typeof v === "string" && v.trim().length === 0)
+  );
+}
+
 function toNumberOrNull(v: any): number | null {
   if (v === null || v === undefined) return null;
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
@@ -48,8 +59,6 @@ function toNumberOrNull(v: any): number | null {
   const cleaned = s.replace(/[^\d.,]/g, "");
   if (!cleaned) return null;
 
-  // If both comma and dot exist, assume dot = thousand separator, comma = decimal OR vice versa.
-  // We'll pick the last separator as decimal separator.
   const lastComma = cleaned.lastIndexOf(",");
   const lastDot = cleaned.lastIndexOf(".");
   let normalized = cleaned;
@@ -57,8 +66,8 @@ function toNumberOrNull(v: any): number | null {
   if (lastComma !== -1 && lastDot !== -1) {
     const decSep = lastComma > lastDot ? "," : ".";
     normalized = cleaned
-      .replace(decSep === "," ? /\./g : /,/g, "") // remove the other separator as thousands
-      .replace(decSep, "."); // decimal to dot
+      .replace(decSep === "," ? /\./g : /,/g, "")
+      .replace(decSep, ".");
   } else {
     normalized = cleaned.replace(",", ".");
   }
@@ -88,7 +97,6 @@ function flattenJsonLd(input: any): any[] {
 
     out.push(node);
 
-    // common containers
     if (node["@graph"]) walk(node["@graph"]);
     if (node.graph) walk(node.graph);
     if (node.mainEntity) walk(node.mainEntity);
@@ -107,45 +115,48 @@ function isType(node: any, t: string) {
   const raw = node?.["@type"];
   if (!raw) return false;
   if (typeof raw === "string") return raw.toLowerCase() === want;
-  if (Array.isArray(raw)) return raw.map(String).some((x) => x.toLowerCase() === want);
+  if (Array.isArray(raw))
+    return raw.map(String).some((x) => x.toLowerCase() === want);
   return false;
 }
 
 function parseProductFromLd(nodes: any[]): Parsed {
-  let best: Parsed = {};
+  const best: Parsed = {};
 
-  // Try to pick a Product node first
   const products = nodes.filter((n) => isType(n, "Product"));
   const candidates = products.length ? products : nodes;
 
   for (const n of candidates) {
+    // title
     if (!best.title && (isType(n, "Product") || n?.name)) {
       const name = n?.name ? String(n.name) : "";
       if (name) best.title = name;
     }
 
+    // image
     if (!best.image_url) {
       const img = n?.image;
       if (typeof img === "string") best.image_url = img;
-      if (Array.isArray(img) && typeof img[0] === "string") best.image_url = img[0];
+      if (Array.isArray(img) && typeof img[0] === "string")
+        best.image_url = img[0];
     }
 
-    // Offers parsing
+    // offers
     const offers = n?.offers;
     const offer = Array.isArray(offers) ? offers[0] : offers;
 
-    // Offer
     if (!best.price && offer) {
       const price = offer?.price ?? offer?.lowPrice ?? offer?.highPrice;
       const p = toNumberOrNull(price);
       if (p != null) best.price = p;
 
       const cur =
-        offer?.priceCurrency ? String(offer.priceCurrency) : extractCurrencyLoose(String(price ?? ""));
+        offer?.priceCurrency
+          ? String(offer.priceCurrency)
+          : extractCurrencyLoose(String(price ?? ""));
       if (!best.currency && cur) best.currency = cur;
     }
 
-    // AggregateOffer sometimes has lowPrice/highPrice
     if (!best.price && offer && isType(offer, "AggregateOffer")) {
       const p = toNumberOrNull(offer?.lowPrice ?? offer?.highPrice);
       if (p != null) best.price = p;
@@ -165,7 +176,6 @@ function meta($: cheerio.CheerioAPI, sel: string, attr = "content") {
 
 function parseFromHtml(url: string, html: string): Parsed {
   const $ = cheerio.load(html);
-
   const domain = getDomain(url) || "unknown";
 
   // OG / Twitter basics
@@ -201,7 +211,6 @@ function parseFromHtml(url: string, html: string): Parsed {
       const nodes = flattenJsonLd(json);
       const got = parseProductFromLd(nodes);
 
-      // merge "best"
       ldParsed = {
         title: ldParsed.title || got.title,
         image_url: ldParsed.image_url || got.image_url,
@@ -209,7 +218,9 @@ function parseFromHtml(url: string, html: string): Parsed {
         currency: ldParsed.currency || got.currency,
       };
 
-      if (ldParsed.title && ldParsed.image_url && (ldParsed.price || ldParsed.currency)) break;
+      if (ldParsed.title && ldParsed.image_url && (ldParsed.price || ldParsed.currency)) {
+        break;
+      }
     } catch {
       // ignore
     }
@@ -250,8 +261,22 @@ export async function POST(req: Request) {
     const url = String(body?.url || "");
 
     if (!uid || !itemId || !url) {
-      return NextResponse.json({ ok: false, error: "Missing uid/itemId/url" }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: "Missing uid/itemId/url" },
+        { status: 400 }
+      );
     }
+
+    const ref = adminDb()
+      .collection("users")
+      .doc(uid)
+      .collection("wishlist_items")
+      .doc(itemId);
+
+    // ✅ Load existing item to respect user edits
+    const snap = await ref.get();
+    const current = (snap.exists ? (snap.data() as any) : {}) || {};
+    const userEdited = current.userEdited === true;
 
     const res = await fetch(url, {
       redirect: "follow",
@@ -261,45 +286,74 @@ export async function POST(req: Request) {
       },
     });
 
-    const ref = adminDb()
-      .collection("users")
-      .doc(uid)
-      .collection("wishlist_items")
-      .doc(itemId);
-
     if (!res.ok) {
       await ref.set(
         {
-          enrichStatus: "failed",
+          enrichStatus: "failed" as EnrichStatus,
           enrichError: `HTTP ${res.status}`,
           enrichedAt: admin.firestore.FieldValue.serverTimestamp(),
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         },
         { merge: true }
       );
+      // keep 200 so caller doesn't retry forever
       return NextResponse.json({ ok: false, error: "Fetch failed" }, { status: 200 });
     }
 
     const html = await res.text();
     const parsed = parseFromHtml(url, html);
 
-    // If still no useful fields, mark failed
-    const hasUseful =
+    const parsedHasUseful =
       !!parsed.title || !!parsed.image_url || typeof parsed.price === "number";
 
-    await ref.set(
-      {
-        ...parsed,
-        enrichStatus: hasUseful ? "ok" : "failed",
-        ...(hasUseful ? {} : { enrichError: "No product data found" }),
-        enrichedAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+    // ✅ Prepare updates that respect userEdited
+    const updates: any = {
+      enrichedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
 
-    return NextResponse.json({ ok: true, ...parsed });
+    // Always safe meta:
+    if (!isEmpty(parsed.domain) && isEmpty(current.domain)) updates.domain = parsed.domain;
+    if (!isEmpty(parsed.currency) && isEmpty(current.currency)) updates.currency = parsed.currency;
+
+    // shop: only fill if missing (avoid overriding user choice)
+    if (!isEmpty(parsed.shop) && isEmpty(current.shop)) updates.shop = parsed.shop;
+
+    if (userEdited) {
+      // ONLY fill missing fields
+      if (!isEmpty(parsed.title) && isEmpty(current.title)) updates.title = parsed.title;
+      if (!isEmpty(parsed.image_url) && isEmpty(current.image_url)) updates.image_url = parsed.image_url;
+
+      if (typeof parsed.price === "number" && (current.price === null || current.price === undefined)) {
+        updates.price = parsed.price;
+      }
+    } else {
+      // Normal mode: allow updates when parsed has values
+      if (!isEmpty(parsed.title)) updates.title = parsed.title;
+      if (!isEmpty(parsed.image_url)) updates.image_url = parsed.image_url;
+      if (typeof parsed.price === "number") updates.price = parsed.price;
+
+      if (!isEmpty(parsed.shop)) updates.shop = parsed.shop;
+      if (!isEmpty(parsed.domain)) updates.domain = parsed.domain;
+      if (!isEmpty(parsed.currency)) updates.currency = parsed.currency;
+    }
+
+    // Status + error handling
+    if (!parsedHasUseful) {
+      updates.enrichStatus = "failed" as EnrichStatus;
+      updates.enrichError = "No product data found";
+    } else {
+      updates.enrichStatus = "ok" as EnrichStatus;
+      updates.enrichError = admin.firestore.FieldValue.delete();
+    }
+
+    await ref.set(updates, { merge: true });
+
+    return NextResponse.json({ ok: true, parsed, userEdited, updates });
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: e?.message || "Server error" }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: e?.message || "Server error" },
+      { status: 500 }
+    );
   }
 }

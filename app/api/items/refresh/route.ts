@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { adminAuth, adminDb } from "@/lib/firebaseAdmin";
 import * as admin from "firebase-admin";
-import { parseProductUrl } from "@/lib/scraper/parseProduct";
+import { parseProductUrl } from "unicart-web/lib/scraper/parseProduct";
 
 export async function POST(req: Request) {
   try {
