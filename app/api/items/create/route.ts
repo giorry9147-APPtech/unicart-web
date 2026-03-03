@@ -87,7 +87,7 @@ export async function POST(req: Request) {
       .set(item, { merge: true });
 
     // 4) Fire-and-forget enrichment (do not await)
-    const baseUrl = process.env.BASE_URL || "https://unicart-web.vercel.app";
+    const baseUrl = new URL(req.url).origin;
     const enrichSecret = process.env.ENRICH_SECRET || "";
 
     fetch(`${baseUrl}/api/items/enrich`, {
