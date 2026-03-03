@@ -62,7 +62,7 @@ export async function POST(req: Request) {
       scraperServiceUrl,
       scraperToken,
     });
-
+    
     if (!parsed.ok) {
       await ref.set(
         {
@@ -84,7 +84,7 @@ export async function POST(req: Request) {
 
         // fields your UI likely reads
         title: parsed.title || data?.title || "",
-        imageUrl: parsed.imageUrl || data?.imageUrl || "",
+        image_url: parsed.imageUrl || data?.image_url || "",
         price: parsed.price ?? data?.price ?? null,
         currency: parsed.currency ?? data?.currency ?? null,
 
