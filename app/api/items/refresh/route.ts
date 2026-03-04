@@ -1,7 +1,19 @@
+// unicart-web/app/api/items/refresh/route.ts
 import { NextResponse } from "next/server";
 import { adminAuth, adminDb } from "@/lib/firebaseAdmin";
 import * as admin from "firebase-admin";
 import { parseProductUrl } from "@/lib/scraper/parseProduct";
+
+function normalizeUrl(input: string) {
+  try {
+    const u = new URL(input);
+    u.hash = "";
+    u.search = "";
+    return u.toString();
+  } catch {
+    return input;
+  }
+}
 
 export async function POST(req: Request) {
   try {
@@ -36,11 +48,12 @@ export async function POST(req: Request) {
 
     const data = snap.data() as any;
 
-    // support both fields just in case you have mixed data
-    const url = String(data?.product_url || data?.url || "").trim();
-    if (!url) {
+    const urlRaw = String(data?.product_url || data?.url || "").trim();
+    if (!urlRaw) {
       return NextResponse.json({ ok: false, error: "Item has no product_url" }, { status: 400 });
     }
+
+    const url = normalizeUrl(urlRaw);
 
     // 4) Mark pending (UX)
     await ref.set(
@@ -52,7 +65,7 @@ export async function POST(req: Request) {
       { merge: true }
     );
 
-    // 5) Parse now (tiered: html -> playwright via env)
+    // 5) Parse now (tiered)
     const debug = process.env.SCRAPE_DEBUG === "1";
     const scraperServiceUrl = process.env.SCRAPER_SERVICE_URL || undefined;
     const scraperToken = process.env.SCRAPER_TOKEN || undefined;
@@ -62,7 +75,7 @@ export async function POST(req: Request) {
       scraperServiceUrl,
       scraperToken,
     });
-    
+
     if (!parsed.ok) {
       await ref.set(
         {
@@ -76,20 +89,16 @@ export async function POST(req: Request) {
       return NextResponse.json(parsed, { status: 502 });
     }
 
-    // 6) Write back to Firestore (map to your schema)
+    // 6) Write back to Firestore (underscore schema)
     await ref.set(
       {
-        // keep your url field stable
-        product_url: url,
-
-        // fields your UI likely reads
+        product_url: url, // ✅ canonical url
         title: parsed.title || data?.title || "",
         image_url: parsed.imageUrl || data?.image_url || "",
         price: parsed.price ?? data?.price ?? null,
         currency: parsed.currency ?? data?.currency ?? null,
 
-        // status/meta
-        enrichStatus: "success",
+        enrichStatus: "ok",
         enrichError: admin.firestore.FieldValue.delete(),
         parseSource: parsed.source,
         parseConfidence: parsed.confidence,
@@ -100,7 +109,7 @@ export async function POST(req: Request) {
       { merge: true }
     );
 
-    return NextResponse.json({ ok: true, itemId, parsed });
+    return NextResponse.json({ ok: true, itemId });
   } catch (e: any) {
     return NextResponse.json(
       { ok: false, error: e?.message || "Server error" },
