@@ -1,15 +1,43 @@
-// unicart-web/lib/scraper/parseProduct.ts
 import * as cheerio from "cheerio";
+
+type FieldValue<T> = {
+  value: T;
+  source: string;
+  confidence: number;
+};
+
+export type Attempt = {
+  layer: string;
+  ok: boolean;
+  notes?: string;
+};
+
+export type ProductDraft = {
+  urlInput: string;
+  canonicalUrl?: string;
+  domain?: string;
+  title?: FieldValue<string>;
+  image?: FieldValue<string>;
+  price?: FieldValue<{ amount: number; currency: string }>;
+  status: "complete" | "partial" | "needs_user_input" | "blocked";
+  missing: string[];
+  attempts: Attempt[];
+};
 
 export type ParseResult = {
   ok: true;
   url: string;
+  canonicalUrl: string;
+  domain: string;
   title: string;
   imageUrl: string;
   price: number | null;
   currency: string | null;
   source: "shopify_json" | "jsonld" | "opengraph" | "html" | "playwright";
-  confidence: number; // 0..1
+  confidence: number;
+  draftStatus: ProductDraft["status"];
+  missing: string[];
+  attempts: Attempt[];
   warnings?: string[];
   debug?: any;
 };
@@ -20,15 +48,12 @@ export type ParseFail = {
   error: string;
   status?: number;
   source?: string;
+  blockedReason?: string;
   debug?: any;
 };
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36";
-
-/** ---------------------------
- * helpers
- * -------------------------- */
 
 function pickFirst(...vals: Array<string | undefined | null>) {
   for (const v of vals) {
@@ -44,6 +69,25 @@ function absUrl(base: string, maybe: string) {
     return new URL(maybe, base).toString();
   } catch {
     return "";
+  }
+}
+
+function normalizeUrl(input: string) {
+  try {
+    const u = new URL(input);
+    u.hash = "";
+    u.search = "";
+    return u.toString();
+  } catch {
+    return input;
+  }
+}
+
+function getDomain(url: string) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "").toLowerCase();
+  } catch {
+    return "unknown";
   }
 }
 
@@ -82,6 +126,183 @@ function extractCurrencyLoose(s: string): string | null {
   return null;
 }
 
+function inferCurrencyFromDomain(domain?: string) {
+  const d = String(domain || "").toLowerCase();
+  if (!d) return null;
+
+  if (d.endsWith(".co.uk") || d.endsWith(".uk")) return "GBP";
+  if (d.endsWith(".com")) return null;
+  if (
+    d.endsWith(".nl") ||
+    d.endsWith(".de") ||
+    d.endsWith(".fr") ||
+    d.endsWith(".be") ||
+    d.endsWith(".es") ||
+    d.endsWith(".it") ||
+    d.endsWith(".pt")
+  ) {
+    return "EUR";
+  }
+
+  return null;
+}
+
+type PriceCandidate = {
+  amount: number;
+  currency: string;
+  confidence: number;
+  source: string;
+  notes: string;
+};
+
+function getPriceTextCandidates(text: string): string[] {
+  const out = new Set<string>();
+  const raw = String(text || "").replace(/\s+/g, " ");
+
+  const moneyRegex =
+    /(€\s?\d{1,3}(?:[.\s]\d{3})*(?:[,\.]\d{2})?|\$\s?\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2})?|£\s?\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2})?|\d{1,3}(?:[.\s]\d{3})*(?:[,\.]\d{2})\s?(?:EUR|USD|GBP))/gi;
+
+  for (const m of raw.matchAll(moneyRegex)) {
+    const v = String(m[0] || "").trim();
+    if (v) out.add(v);
+  }
+
+  return Array.from(out);
+}
+
+function scorePriceContext(context: string) {
+  const c = context.toLowerCase();
+  let s = 0.5;
+
+  if (/(price|our price|sale|deal|current|now|final|pay)/.test(c)) s += 0.25;
+  if (/(old|was|before|list|advies|msrp|rrp|from)/.test(c)) s -= 0.2;
+  if (/(shipping|delivery|tax|vat|fee|installment)/.test(c)) s -= 0.2;
+  if (/(cart|basket|wishlist)/.test(c)) s -= 0.1;
+
+  return Math.max(0.1, Math.min(0.95, s));
+}
+
+function extractDomPriceCandidates(
+  $: cheerio.CheerioAPI,
+  domain?: string
+): PriceCandidate[] {
+  const candidates: PriceCandidate[] = [];
+  const seen = new Set<string>();
+
+  const pushCandidate = (
+    amountRaw: any,
+    currencyRaw: any,
+    source: string,
+    context: string
+  ) => {
+    const amount = toNumberOrNull(amountRaw);
+    let currency = extractCurrencyLoose(String(currencyRaw ?? ""));
+
+    if (!currency) {
+      currency = extractCurrencyLoose(String(context || ""));
+    }
+    if (!currency) {
+      currency = inferCurrencyFromDomain(domain) || null;
+    }
+
+    if (amount == null || !currency) return;
+
+    const key = `${amount}:${currency}:${source}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    candidates.push({
+      amount,
+      currency,
+      confidence: scorePriceContext(context),
+      source,
+      notes: context.slice(0, 200),
+    });
+  };
+
+  // Structured/meta candidates first.
+  const structured: Array<{ amount: any; currency: any; source: string; context: string }> = [
+    {
+      amount: $('meta[property="product:price:amount"]').attr("content"),
+      currency: $('meta[property="product:price:currency"]').attr("content"),
+      source: "dom_meta_product",
+      context: "meta product price",
+    },
+    {
+      amount: $('meta[name="product:price:amount"]').attr("content"),
+      currency: $('meta[name="product:price:currency"]').attr("content"),
+      source: "dom_meta_name_product",
+      context: "meta name product price",
+    },
+    {
+      amount: $('[itemprop="price"]').attr("content") || $('[itemprop="price"]').first().text(),
+      currency:
+        $('[itemprop="priceCurrency"]').attr("content") ||
+        $('[itemprop="priceCurrency"]').first().text(),
+      source: "dom_itemprop_price",
+      context: "itemprop price",
+    },
+    {
+      amount: $('meta[property="og:price:amount"]').attr("content"),
+      currency: $('meta[property="og:price:currency"]').attr("content"),
+      source: "dom_meta_og_price",
+      context: "meta og price",
+    },
+  ];
+
+  for (const c of structured) {
+    pushCandidate(c.amount, c.currency, c.source, c.context);
+  }
+
+  // DOM selectors commonly used by storefronts.
+  const domSelector =
+    '[data-price], [data-price-amount], [data-product-price], [class*="price" i], [id*="price" i], [aria-label*="price" i]';
+
+  $(domSelector)
+    .slice(0, 120)
+    .each((_, el) => {
+      const node = $(el);
+      const text = [
+        node.attr("content"),
+        node.attr("data-price"),
+        node.attr("data-price-amount"),
+        node.attr("data-product-price"),
+        node.attr("aria-label"),
+        node.text(),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+
+      if (!text) return;
+
+      const currencyHint = [
+        node.attr("data-currency"),
+        node.attr("data-price-currency"),
+        node.attr("content"),
+      ]
+        .filter(Boolean)
+        .join(" ");
+
+      for (const moneyText of getPriceTextCandidates(text)) {
+        pushCandidate(moneyText, currencyHint || moneyText, "dom_selector_price", text);
+      }
+    });
+
+  return candidates;
+}
+
+function pickBestPriceCandidate(candidates: PriceCandidate[]): PriceCandidate | null {
+  if (!candidates.length) return null;
+
+  const sorted = [...candidates].sort((a, b) => {
+    if (b.confidence !== a.confidence) return b.confidence - a.confidence;
+    return a.amount - b.amount;
+  });
+
+  return sorted[0] ?? null;
+}
+
 function flattenJsonLd(input: any): any[] {
   const out: any[] = [];
   const walk = (node: any) => {
@@ -107,8 +328,7 @@ function isType(node: any, t: string) {
   const raw = node?.["@type"];
   if (!raw) return false;
   if (typeof raw === "string") return raw.toLowerCase() === want;
-  if (Array.isArray(raw))
-    return raw.map(String).some((x) => x.toLowerCase() === want);
+  if (Array.isArray(raw)) return raw.map(String).some((x) => x.toLowerCase() === want);
   return false;
 }
 
@@ -146,9 +366,7 @@ function parseFromJsonLd(url: string, $: cheerio.CheerioAPI) {
         const offer = Array.isArray(offers) ? offers[0] : offers;
 
         if (price == null && offer) {
-          const p = toNumberOrNull(
-            offer?.price ?? offer?.lowPrice ?? offer?.highPrice
-          );
+          const p = toNumberOrNull(offer?.price ?? offer?.lowPrice ?? offer?.highPrice);
           if (p != null) price = p;
 
           const cur = offer?.priceCurrency
@@ -160,11 +378,36 @@ function parseFromJsonLd(url: string, $: cheerio.CheerioAPI) {
         if (title && imageUrl && (price != null || currency)) break;
       }
     } catch {
-      // ignore bad JSON-LD blocks
+      // ignore malformed JSON-LD blocks
     }
   }
 
   return { title, imageUrl, price, currency };
+}
+
+function parseFastMetadata(url: string, $: cheerio.CheerioAPI) {
+  const title = pickFirst(
+    $('meta[property="og:title"]').attr("content"),
+    $('meta[name="twitter:title"]').attr("content"),
+    $("title").text()
+  );
+
+  const imageUrl = absUrl(
+    url,
+    pickFirst(
+      $('meta[property="og:image"]').attr("content"),
+      $('meta[name="twitter:image"]').attr("content")
+    )
+  );
+
+  const canonicalRaw = pickFirst(
+    $('link[rel="canonical"]').attr("href"),
+    $('meta[property="og:url"]').attr("content")
+  );
+
+  const canonicalUrl = canonicalRaw ? normalizeUrl(absUrl(url, canonicalRaw)) : "";
+
+  return { title, imageUrl, canonicalUrl };
 }
 
 function score({ title, imageUrl, price, currency }: any) {
@@ -176,15 +419,131 @@ function score({ title, imageUrl, price, currency }: any) {
   return Math.max(0, Math.min(1, s));
 }
 
-/** Browser-ish headers help a lot for “semi-protected” sites */
+function makeDraft(urlInput: string): ProductDraft {
+  const canonicalUrl = normalizeUrl(urlInput);
+  return {
+    urlInput,
+    canonicalUrl,
+    domain: getDomain(canonicalUrl),
+    status: "partial",
+    missing: ["title", "image", "price.amount", "price.currency"],
+    attempts: [],
+  };
+}
+
+function computeMissing(draft: ProductDraft) {
+  const missing: string[] = [];
+  if (!draft.title?.value) missing.push("title");
+  if (!draft.image?.value) missing.push("image");
+  if (draft.price?.value?.amount == null) missing.push("price.amount");
+  if (!draft.price?.value?.currency) missing.push("price.currency");
+  if (!draft.canonicalUrl) missing.push("canonicalUrl");
+  if (!draft.domain) missing.push("domain");
+  return missing;
+}
+
+function refreshDraftStatus(draft: ProductDraft) {
+  draft.missing = computeMissing(draft);
+  if (draft.status === "blocked") return;
+  draft.status = draft.missing.length === 0 ? "complete" : "partial";
+}
+
+function addAttempt(draft: ProductDraft, layer: string, ok: boolean, notes?: string) {
+  draft.attempts.push({ layer, ok, notes });
+}
+
+function mergeCanonical(draft: ProductDraft, value: string | null | undefined) {
+  const next = String(value ?? "").trim();
+  if (!next) return;
+  draft.canonicalUrl = normalizeUrl(next);
+  draft.domain = getDomain(draft.canonicalUrl);
+}
+
+function mergeTitle(
+  draft: ProductDraft,
+  value: string | null | undefined,
+  source: string,
+  confidence: number
+) {
+  if (draft.title?.value) return;
+  const next = String(value ?? "").trim();
+  if (!next) return;
+  draft.title = { value: next, source, confidence };
+}
+
+function mergeImage(
+  draft: ProductDraft,
+  value: string | null | undefined,
+  source: string,
+  confidence: number
+) {
+  if (draft.image?.value) return;
+  const next = String(value ?? "").trim();
+  if (!next) return;
+  draft.image = { value: next, source, confidence };
+}
+
+function mergePrice(
+  draft: ProductDraft,
+  amount: number | null | undefined,
+  currency: string | null | undefined,
+  source: string,
+  confidence: number
+) {
+  if (draft.price?.value?.amount != null && draft.price?.value?.currency) return;
+
+  const cleanAmount = amount != null && Number.isFinite(amount) ? amount : null;
+  const cleanCurrency = String(currency ?? "").trim().toUpperCase();
+  if (cleanAmount == null || !cleanCurrency) return;
+
+  draft.price = {
+    value: { amount: cleanAmount, currency: cleanCurrency },
+    source,
+    confidence,
+  };
+}
+
+function isBlockedContent(text: string) {
+  return !!detectBlockedReason(text);
+}
+
+function detectBlockedReason(text: string): string | null {
+  const hay = text.toLowerCase();
+  if (hay.includes("captcha") || hay.includes("recaptcha") || hay.includes("hcaptcha")) {
+    return "blocked_captcha";
+  }
+  if (hay.includes("access denied") || hay.includes("forbidden")) {
+    return "blocked_access_denied";
+  }
+  if (hay.includes("verify you are human") || hay.includes("are you human") || hay.includes("bot detection")) {
+    return "blocked_human_verification";
+  }
+  if (hay.includes("sign in") || hay.includes("log in") || hay.includes("login required")) {
+    return "blocked_login_wall";
+  }
+  return null;
+}
+
+function missingRequiredFields(draft: ProductDraft): string[] {
+  const missing: string[] = [];
+  if (!draft.title?.value) missing.push("title");
+  if (!draft.image?.value) missing.push("image");
+  if (draft.price?.value?.amount == null) missing.push("price.amount");
+  if (!draft.price?.value?.currency) missing.push("price.currency");
+  return missing;
+}
+
+function hasRequiredFields(draft: ProductDraft): boolean {
+  return missingRequiredFields(draft).length === 0;
+}
+
 function buildBrowserHeaders(targetUrl: string) {
-  const origin = (() => {
-    try {
-      return new URL(targetUrl).origin;
-    } catch {
-      return "";
-    }
-  })();
+  let origin = "";
+  try {
+    origin = new URL(targetUrl).origin;
+  } catch {
+    origin = "";
+  }
 
   return {
     "User-Agent": UA,
@@ -219,14 +578,11 @@ async function fetchWithRetry(url: string, maxTries = 2) {
     }
   }
   throw new Error(
-    `fetch failed after ${maxTries} tries: ${errors
-      .map((x) => x.message)
-      .join(" | ")}`
+    `fetch failed after ${maxTries} tries: ${errors.map((x) => x.message).join(" | ")}`
   );
 }
 
 async function tryShopifyJson(targetUrl: string) {
-  // Shopify: /products/<handle> -> /products/<handle>.js
   let u: URL;
   try {
     u = new URL(targetUrl);
@@ -262,7 +618,6 @@ async function tryShopifyJson(targetUrl: string) {
   const imageUrl =
     Array.isArray(data.images) && data.images[0] ? String(data.images[0]) : "";
 
-  // Shopify variant price often in cents
   let price: number | null = null;
   if (Array.isArray(data.variants) && data.variants[0]?.price != null) {
     const cents = toNumberOrNull(data.variants[0].price);
@@ -273,7 +628,7 @@ async function tryShopifyJson(targetUrl: string) {
     title,
     imageUrl,
     price,
-    currency: null as string | null, // can be filled later
+    currency: null as string | null,
   };
 }
 
@@ -288,25 +643,60 @@ async function callPlaywrightFallback(
       imageUrl: string;
       price: number | null;
       currency: string | null;
+      html?: string;
+      finalUrl?: string;
       debug?: any;
     }
-  | { ok: false; error: string; debug?: any }
+  | { ok: false; error: string; blockedReason?: string; debug?: any }
 > {
   if (!opts.scraperServiceUrl) {
     return { ok: false, error: "scraper_service_not_configured" };
   }
 
+  const fetchWithTimeout = async (timeoutMs: number) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      return await fetch(`${opts.scraperServiceUrl}/scrape?debug=1`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(opts.scraperToken ? { Authorization: `Bearer ${opts.scraperToken}` } : {}),
+        },
+        body: JSON.stringify({ url: inputUrl }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const attempts: string[] = [];
+
   try {
-    const pwRes = await fetch(`${opts.scraperServiceUrl}/scrape`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(opts.scraperToken
-          ? { Authorization: `Bearer ${opts.scraperToken}` }
-          : {}),
-      },
-      body: JSON.stringify({ url: inputUrl }),
-    });
+    let pwRes: Response | null = null;
+    let lastErr: any = null;
+
+    for (let i = 0; i < 2; i++) {
+      try {
+        pwRes = await fetchWithTimeout(25000 + i * 5000);
+        attempts.push(`attempt_${i + 1}:http_${pwRes.status}`);
+        break;
+      } catch (e: any) {
+        lastErr = e;
+        attempts.push(`attempt_${i + 1}:error_${e?.name || "unknown"}`);
+        await new Promise((r) => setTimeout(r, 300 * (i + 1)));
+      }
+    }
+
+    if (!pwRes) {
+      return {
+        ok: false,
+        error: `playwright_request_failed:${lastErr?.message || "unknown"}`,
+        debug: dbg ? { ...dbg, playwrightAttempts: attempts } : { playwrightAttempts: attempts },
+      };
+    }
 
     const data = await pwRes.json().catch(() => null);
 
@@ -314,11 +704,26 @@ async function callPlaywrightFallback(
       return {
         ok: false,
         error: `playwright_http_${pwRes.status}`,
-        debug: dbg ? { ...dbg, playwrightBody: data } : undefined,
+        debug: dbg
+          ? { ...dbg, playwrightBody: data, playwrightAttempts: attempts }
+          : { playwrightBody: data, playwrightAttempts: attempts },
       };
     }
 
-    // expected shape from our scraper: { ok:true, title, imageUrl, price, currency, html? }
+    if (typeof data?.html === "string") {
+      const blockedReason = detectBlockedReason(data.html);
+      if (blockedReason) {
+        return {
+          ok: false,
+          error: blockedReason,
+          blockedReason,
+          debug: dbg
+            ? { ...dbg, playwrightAttempts: attempts }
+            : { playwrightAttempts: attempts },
+        };
+      }
+    }
+
     if (data?.ok && data?.title) {
       return {
         ok: true,
@@ -326,29 +731,16 @@ async function callPlaywrightFallback(
         imageUrl: absUrl(inputUrl, String(data.imageUrl || "")),
         price: data.price != null ? toNumberOrNull(data.price) : null,
         currency: data.currency ? String(data.currency) : null,
+        html: typeof data?.html === "string" ? data.html : undefined,
+        finalUrl: typeof data?.url === "string" ? data.url : undefined,
+        debug: dbg ? { ...dbg, playwrightAttempts: attempts } : { playwrightAttempts: attempts },
       };
     }
 
-    // fallback if service returns html but not extracted
     if (data?.html && typeof data.html === "string") {
       const $$ = cheerio.load(data.html);
       const ld2 = parseFromJsonLd(inputUrl, $$);
-
-      const title2 = pickFirst(
-        ld2.title,
-        $$('meta[property="og:title"]').attr("content"),
-        $$('meta[name="twitter:title"]').attr("content"),
-        $$("title").text()
-      );
-
-      const img2 = absUrl(
-        inputUrl,
-        pickFirst(
-          ld2.imageUrl,
-          $$('meta[property="og:image"]').attr("content"),
-          $$('meta[name="twitter:image"]').attr("content")
-        )
-      );
+      const fast2 = parseFastMetadata(inputUrl, $$);
 
       const metaPrice2 = pickFirst(
         $$('meta[property="product:price:amount"]').attr("content"),
@@ -372,10 +764,13 @@ async function callPlaywrightFallback(
 
       return {
         ok: true,
-        title: title2 || "",
-        imageUrl: img2 || "",
+        title: pickFirst(ld2.title, fast2.title),
+        imageUrl: absUrl(inputUrl, pickFirst(ld2.imageUrl, fast2.imageUrl)),
         price: price2,
         currency: cur2,
+        html: data.html,
+        finalUrl: typeof data?.url === "string" ? data.url : undefined,
+        debug: dbg ? { ...dbg, playwrightAttempts: attempts } : { playwrightAttempts: attempts },
       };
     }
 
@@ -385,52 +780,147 @@ async function callPlaywrightFallback(
   }
 }
 
-/** ---------------------------
- * main
- * -------------------------- */
+function resultFromDraft(params: {
+  draft: ProductDraft;
+  source: ParseResult["source"];
+  confidence: number;
+  warnings?: string[];
+  debug?: any;
+}): ParseResult {
+  const { draft, source, confidence, warnings, debug } = params;
+  refreshDraftStatus(draft);
+  const canonicalUrl = draft.canonicalUrl || normalizeUrl(draft.urlInput);
+  const domain = draft.domain || getDomain(canonicalUrl);
+
+  return {
+    ok: true,
+    url: canonicalUrl,
+    canonicalUrl,
+    domain,
+    title: draft.title?.value || "",
+    imageUrl: draft.image?.value || "",
+    price: draft.price?.value?.amount ?? null,
+    currency: draft.price?.value?.currency ?? null,
+    source,
+    confidence,
+    draftStatus: draft.status,
+    missing: draft.missing,
+    attempts: draft.attempts,
+    warnings,
+    debug,
+  };
+}
+
+function applyHtmlLayersToDraft(params: {
+  draft: ProductDraft;
+  html: string;
+  pageUrl: string;
+  tierTag: "html" | "playwright";
+  tierLabel: string;
+  dbg?: any;
+}) {
+  const { draft, html, pageUrl, tierTag, tierLabel, dbg } = params;
+  const $ = cheerio.load(html);
+
+  const fast = parseFastMetadata(pageUrl, $);
+  mergeCanonical(draft, fast.canonicalUrl || pageUrl);
+  mergeTitle(draft, fast.title, tierTag === "playwright" ? "playwright" : "opengraph", tierTag === "playwright" ? 0.78 : 0.7);
+  mergeImage(draft, fast.imageUrl, tierTag === "playwright" ? "playwright" : "opengraph", tierTag === "playwright" ? 0.8 : 0.75);
+  addAttempt(
+    draft,
+    `${tierLabel}_layer1_fast_metadata`,
+    !!fast.title || !!fast.imageUrl,
+    "og/twitter/title/canonical"
+  );
+
+  dbg?.tiersTried.push(tierTag === "playwright" ? "playwright_jsonld" : "jsonld");
+  const ld = parseFromJsonLd(pageUrl, $);
+  mergeTitle(draft, ld.title, tierTag === "playwright" ? "playwright" : "jsonld", 0.9);
+  mergeImage(draft, ld.imageUrl, tierTag === "playwright" ? "playwright" : "jsonld", 0.85);
+  mergePrice(draft, ld.price, ld.currency, tierTag === "playwright" ? "playwright" : "jsonld", 0.95);
+  addAttempt(
+    draft,
+    `${tierLabel}_layer2_jsonld`,
+    !!ld.title || !!ld.imageUrl || ld.price != null,
+    "jsonld parsed"
+  );
+
+  const domPriceCandidates = extractDomPriceCandidates($, draft.domain);
+  const bestDomPrice = pickBestPriceCandidate(domPriceCandidates);
+
+  if (bestDomPrice) {
+    mergePrice(
+      draft,
+      bestDomPrice.amount,
+      bestDomPrice.currency,
+      tierTag === "playwright" ? "playwright" : "html",
+      Math.max(0.65, bestDomPrice.confidence)
+    );
+  }
+
+  addAttempt(
+    draft,
+    `${tierLabel}_layer3_dom_heuristics`,
+    !!bestDomPrice,
+    bestDomPrice
+      ? `${bestDomPrice.source} amount=${bestDomPrice.amount} currency=${bestDomPrice.currency}`
+      : "no ranked dom price candidate"
+  );
+
+  refreshDraftStatus(draft);
+}
 
 export async function parseProductUrl(
   inputUrl: string,
-  opts: {
-    debug: boolean;
-    scraperServiceUrl?: string;
-    scraperToken?: string;
-  }
+  opts: { debug: boolean; scraperServiceUrl?: string; scraperToken?: string }
 ): Promise<ParseResult | ParseFail> {
+  inputUrl = normalizeUrl(inputUrl);
+
+  const draft = makeDraft(inputUrl);
   const warnings: string[] = [];
   const dbg: any = opts.debug ? { tiersTried: [] as string[] } : undefined;
+  let fetchedNonOkStatus: number | null = null;
 
-  // Tier 0: Shopify JSON (fast win)
+  const hasPlaywrightService =
+    !!opts.scraperServiceUrl &&
+    /^https?:\/\//i.test(opts.scraperServiceUrl) &&
+    !opts.scraperServiceUrl.includes("<");
+
+  if (opts.scraperServiceUrl && !hasPlaywrightService) {
+    warnings.push("scraper_service_misconfigured");
+    addAttempt(draft, "playwright_config", false, "SCRAPER_SERVICE_URL is not a valid http(s) URL");
+  }
+
+  // Layer 0/adapter fast win: Shopify JSON
   try {
     dbg?.tiersTried.push("shopify_json");
     const shop = await tryShopifyJson(inputUrl);
+    addAttempt(draft, "layer2_shopify_json", !!shop?.title, shop?.title ? "shopify hit" : "no shopify data");
+
     if (shop?.title) {
       const conf = score(shop);
+      mergeTitle(draft, shop.title, "shopify_json", conf);
+      mergeImage(draft, absUrl(inputUrl, shop.imageUrl), "shopify_json", conf);
+      mergePrice(draft, shop.price, shop.currency, "shopify_json", conf);
+      refreshDraftStatus(draft);
 
       if (!shop.currency) warnings.push("currency_missing");
-
-      if (conf >= 0.7) {
-        return {
-          ok: true,
-          url: inputUrl,
-          title: shop.title,
-          imageUrl: absUrl(inputUrl, shop.imageUrl),
-          price: shop.price ?? null,
-          currency: shop.currency ?? null,
+      if (draft.status === "complete" && conf >= 0.7) {
+        return resultFromDraft({
+          draft,
           source: "shopify_json",
           confidence: conf,
           warnings: warnings.length ? warnings : undefined,
           debug: dbg,
-        };
+        });
       }
-      // else keep going for better completeness
     }
   } catch (e: any) {
     warnings.push("shopify_json_failed");
     if (dbg) dbg.shopifyError = e?.message ?? String(e);
   }
 
-  // Tier 1: HTML fetch
+  // Fetch HTML once
   let res: Response;
   let html: string;
 
@@ -440,189 +930,247 @@ export async function parseProductUrl(
     res = got.res;
     html = got.text;
 
-    // Improvement: on 403/429 try Playwright instead of failing immediately
-    if (!res.ok) {
-      const blocked = res.status === 403 || res.status === 429;
-      const status = res.status;
+    mergeCanonical(draft, res.url || inputUrl);
+    addAttempt(
+      draft,
+      "layer0_url_canonical",
+      !!draft.canonicalUrl,
+      draft.canonicalUrl ? "normalized + redirects" : "canonical unresolved"
+    );
 
-      if (blocked && opts.scraperServiceUrl) {
+    if (!res.ok) {
+      fetchedNonOkStatus = res.status;
+      if (hasPlaywrightService) {
         dbg?.tiersTried.push("playwright");
         const pw = await callPlaywrightFallback(inputUrl, opts, dbg);
+        addAttempt(
+          draft,
+          "layer4_playwright",
+          pw.ok,
+          pw.ok ? `playwright extraction after http_${res.status}` : pw.error
+        );
 
         if (pw.ok) {
-          const confPw = score(pw);
+          const confPw = Math.max(0.75, score(pw));
+          mergeCanonical(draft, pw.finalUrl || inputUrl);
+
+          if (pw.html) {
+            applyHtmlLayersToDraft({
+              draft,
+              html: pw.html,
+              pageUrl: pw.finalUrl || inputUrl,
+              tierTag: "playwright",
+              tierLabel: "playwright",
+              dbg,
+            });
+          }
+
+          mergeTitle(draft, pw.title, "playwright", confPw);
+          mergeImage(draft, pw.imageUrl, "playwright", confPw);
+          mergePrice(draft, pw.price, pw.currency, "playwright", confPw);
+          refreshDraftStatus(draft);
 
           if (!pw.title) warnings.push("title_missing");
           if (!pw.imageUrl) warnings.push("image_missing");
           if (pw.price == null) warnings.push("price_missing");
           if (!pw.currency) warnings.push("currency_missing");
 
-          return {
-            ok: true,
-            url: inputUrl,
-            title: pw.title || "",
-            imageUrl: pw.imageUrl || "",
-            price: pw.price ?? null,
-            currency: pw.currency ?? null,
+          return resultFromDraft({
+            draft,
             source: "playwright",
-            confidence: Math.max(0.75, confPw),
+            confidence: confPw,
             warnings: warnings.length ? warnings : undefined,
             debug: dbg,
-          };
+          });
         }
+      }
+
+      if (isBlockedContent(html)) {
+        const blockedReason = detectBlockedReason(html) || "blocked_unknown";
+        draft.status = "blocked";
+        refreshDraftStatus(draft);
+        addAttempt(draft, "layer6_blocked_detection", true, blockedReason);
 
         return {
           ok: false,
-          url: inputUrl,
-          error: `Blocked (${status}) and playwright failed: ${pw.error}`,
-          status,
-          source: "playwright",
-          debug: dbg,
+          url: draft.canonicalUrl || inputUrl,
+          error: blockedReason,
+          source: "html",
+          blockedReason,
+          debug: dbg ? { ...dbg, fetchedStatus: res.status, fetchedBytes: html?.length ?? 0 } : undefined,
         };
       }
 
-      return {
-        ok: false,
-        url: inputUrl,
-        error: `Fetch failed: ${res.status} ${res.statusText}`,
-        status: res.status,
-        source: "html",
-        debug: dbg ? { ...dbg, fetchedBytes: html?.length ?? 0 } : undefined,
-      };
+      warnings.push(`http_${res.status}`);
+      addAttempt(
+        draft,
+        "layer_http_non_ok",
+        true,
+        `continue parsing non-ok html status ${res.status}`
+      );
     }
   } catch (e: any) {
     return {
       ok: false,
-      url: inputUrl,
+      url: draft.canonicalUrl || inputUrl,
       error: e?.message ?? "Fetch failed",
       source: "html",
       debug: dbg,
     };
   }
 
-  const $ = cheerio.load(html);
+  if (isBlockedContent(html)) {
+    const blockedReason = detectBlockedReason(html) || "blocked_unknown";
+    addAttempt(draft, "layer6_blocked_detection", true, blockedReason);
 
-  // Tier 2: JSON-LD
-  dbg?.tiersTried.push("jsonld");
-  const ld = parseFromJsonLd(inputUrl, $);
+    if (hasPlaywrightService) {
+      dbg?.tiersTried.push("playwright");
+      const pw = await callPlaywrightFallback(inputUrl, opts, dbg);
+      addAttempt(
+        draft,
+        "layer4_playwright",
+        pw.ok,
+        pw.ok ? `playwright extraction after ${blockedReason}` : pw.error
+      );
 
-  // Tier 3: OG/meta fallback
-  dbg?.tiersTried.push("opengraph");
-  const ogTitle = pickFirst(
-    $('meta[property="og:title"]').attr("content"),
-    $('meta[name="twitter:title"]').attr("content"),
-    $("title").text()
-  );
+      if (pw.ok) {
+        const confPw = Math.max(0.75, score(pw));
+        mergeCanonical(draft, pw.finalUrl || inputUrl);
 
-  const ogImage = pickFirst(
-    $('meta[property="og:image"]').attr("content"),
-    $('meta[name="twitter:image"]').attr("content")
-  );
+        if (pw.html) {
+          applyHtmlLayersToDraft({
+            draft,
+            html: pw.html,
+            pageUrl: pw.finalUrl || inputUrl,
+            tierTag: "playwright",
+            tierLabel: "playwright",
+            dbg,
+          });
+        }
 
-  const metaPrice = pickFirst(
-    $('meta[property="product:price:amount"]').attr("content"),
-    $('meta[name="product:price:amount"]').attr("content"),
-    $('[itemprop="price"]').attr("content"),
-    $('[itemprop="price"]').first().text(),
-    $('meta[property="og:price:amount"]').attr("content")
-  );
+        mergeTitle(draft, pw.title, "playwright", confPw);
+        mergeImage(draft, pw.imageUrl, "playwright", confPw);
+        mergePrice(draft, pw.price, pw.currency, "playwright", confPw);
+        refreshDraftStatus(draft);
 
-  const metaCurrency = pickFirst(
-    $('meta[property="product:price:currency"]').attr("content"),
-    $('meta[name="product:price:currency"]').attr("content"),
-    $('[itemprop="priceCurrency"]').attr("content"),
-    $('[itemprop="priceCurrency"]').first().text()
-  );
-
-  const merged = {
-    title: pickFirst(ld.title, ogTitle),
-    imageUrl: absUrl(inputUrl, pickFirst(ld.imageUrl, ogImage)),
-    price: ld.price != null ? ld.price : toNumberOrNull(metaPrice),
-    currency:
-      ld.currency ||
-      (metaCurrency ? metaCurrency.trim() : null) ||
-      extractCurrencyLoose(metaPrice || ""),
-  };
-
-  const conf = score(merged);
-  if (!merged.title) warnings.push("title_missing");
-  if (!merged.imageUrl) warnings.push("image_missing");
-  if (merged.price == null) warnings.push("price_missing");
-  if (!merged.currency) warnings.push("currency_missing");
-
-  // Improvement: low-confidence or missing title => try Playwright (if configured)
-  const needsPlaywright = !!opts.scraperServiceUrl && (!merged.title || conf < 0.4);
-
-  if (needsPlaywright) {
-    dbg?.tiersTried.push("playwright");
-    const pw = await callPlaywrightFallback(inputUrl, opts, dbg);
-
-    if (!pw.ok) {
-      warnings.push("playwright_failed");
-      if (dbg) dbg.playwrightError = pw.error;
-    } else if (pw.title) {
-      const conf2 = score(pw);
-      const finalConf = Math.max(conf, conf2, 0.75);
-
-      const finalTitle = pw.title || merged.title || "";
-      const finalImage = pw.imageUrl || merged.imageUrl || "";
-      const finalPrice = pw.price ?? merged.price ?? null;
-      const finalCurrency = pw.currency ?? merged.currency ?? null;
-
-      const w2: string[] = [];
-      if (!finalTitle) w2.push("title_missing");
-      if (!finalImage) w2.push("image_missing");
-      if (finalPrice == null) w2.push("price_missing");
-      if (!finalCurrency) w2.push("currency_missing");
-
-      return {
-        ok: true,
-        url: inputUrl,
-        title: finalTitle,
-        imageUrl: finalImage,
-        price: finalPrice,
-        currency: finalCurrency,
-        source: "playwright",
-        confidence: finalConf,
-        warnings: w2.length ? w2 : undefined,
-        debug: dbg
-          ? { ...dbg, fetchedStatus: res.status, fetchedBytes: html.length }
-          : undefined,
-      };
+        return resultFromDraft({
+          draft,
+          source: "playwright",
+          confidence: confPw,
+          warnings: warnings.length ? warnings : undefined,
+          debug: dbg,
+        });
+      }
     }
-  }
 
-  // If "good enough" return HTML-derived
-  if (conf >= 0.55 || merged.title) {
+    draft.status = "blocked";
+    refreshDraftStatus(draft);
     return {
-      ok: true,
-      url: inputUrl,
-      title: merged.title || "",
-      imageUrl: merged.imageUrl || "",
-      price: merged.price ?? null,
-      currency: merged.currency ?? null,
-      source: ld.title || ld.price != null ? "jsonld" : "opengraph",
-      confidence: conf,
-      warnings: warnings.length ? warnings : undefined,
-      debug: dbg
-        ? { ...dbg, fetchedStatus: res.status, fetchedBytes: html.length }
-        : undefined,
+      ok: false,
+      url: draft.canonicalUrl || inputUrl,
+      error: blockedReason,
+      source: "html",
+      blockedReason,
+      debug: dbg,
     };
   }
 
-  // Last fallback: return what we have (low confidence)
-  return {
-    ok: true,
-    url: inputUrl,
-    title: merged.title || "",
-    imageUrl: merged.imageUrl || "",
-    price: merged.price ?? null,
-    currency: merged.currency ?? null,
-    source: "html",
+  dbg?.tiersTried.push("opengraph");
+  applyHtmlLayersToDraft({
+    draft,
+    html,
+    pageUrl: res.url || inputUrl,
+    tierTag: "html",
+    tierLabel: "layer",
+    dbg,
+  });
+
+  const mergedForScore = {
+    title: draft.title?.value || "",
+    imageUrl: draft.image?.value || "",
+    price: draft.price?.value?.amount ?? null,
+    currency: draft.price?.value?.currency ?? null,
+  };
+  const conf = score(mergedForScore);
+
+  // Step C: run Playwright only when required fields are still missing.
+  const needsPlaywright = !!opts.scraperServiceUrl && !hasRequiredFields(draft);
+  if (needsPlaywright) {
+    dbg?.tiersTried.push("playwright");
+    const pw = await callPlaywrightFallback(inputUrl, opts, dbg);
+    addAttempt(draft, "layer4_playwright", pw.ok, pw.ok ? "playwright extraction" : pw.error);
+
+    if (pw.ok) {
+      const conf2 = Math.max(conf, score(pw), 0.75);
+      mergeCanonical(draft, pw.finalUrl || inputUrl);
+
+      if (pw.html) {
+        const renderedBlockedReason = detectBlockedReason(pw.html);
+        if (renderedBlockedReason) {
+          draft.status = "blocked";
+          refreshDraftStatus(draft);
+          addAttempt(draft, "layer6_blocked_detection_playwright", true, renderedBlockedReason);
+
+          return {
+            ok: false,
+            url: draft.canonicalUrl || inputUrl,
+            error: renderedBlockedReason,
+            source: "playwright",
+            blockedReason: renderedBlockedReason,
+            debug: dbg,
+          };
+        }
+
+        applyHtmlLayersToDraft({
+          draft,
+          html: pw.html,
+          pageUrl: pw.finalUrl || inputUrl,
+          tierTag: "playwright",
+          tierLabel: "playwright",
+          dbg,
+        });
+      }
+
+      // keep direct service fields as a final assist
+      mergeTitle(draft, pw.title, "playwright", conf2);
+      mergeImage(draft, pw.imageUrl, "playwright", conf2);
+      mergePrice(draft, pw.price, pw.currency, "playwright", conf2);
+      refreshDraftStatus(draft);
+
+      return resultFromDraft({
+        draft,
+        source: "playwright",
+        confidence: conf2,
+        warnings: warnings.length ? warnings : undefined,
+        debug: dbg ? { ...dbg, fetchedStatus: res.status, fetchedBytes: html.length } : undefined,
+      });
+    }
+
+    warnings.push("playwright_failed");
+    if (pw.blockedReason) {
+      warnings.push(pw.blockedReason);
+    }
+    if (dbg) dbg.playwrightError = pw.error;
+  }
+
+  const finalSource: ParseResult["source"] =
+    draft.title?.source === "jsonld" ||
+    draft.image?.source === "jsonld" ||
+    draft.price?.source === "jsonld"
+      ? "jsonld"
+      : "opengraph";
+
+  return resultFromDraft({
+    draft,
+    source: finalSource,
     confidence: conf,
     warnings: warnings.length ? warnings : undefined,
     debug: dbg
-      ? { ...dbg, fetchedStatus: res.status, fetchedBytes: html.length }
+      ? {
+          ...dbg,
+          fetchedStatus: fetchedNonOkStatus ?? res.status,
+          fetchedBytes: html.length,
+        }
       : undefined,
-  };
+  });
 }

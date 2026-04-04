@@ -57,12 +57,14 @@ export async function POST(req: Request) {
     const imageIn = String(body?.image_url || "").trim();
     const categoryIn = String(body?.category || "").trim();
     const priceIn = toNumberOrNull(body?.price);
+    const currencyIn = String(body?.currency || "").trim();
 
     // 3) Minimal item that matches wishlist.tsx fields
     const item: any = {
       id: itemId,
       title: titleIn || domain,
       price: priceIn,
+      currency: currencyIn || null,
       shop: shopIn || domain,
       product_url: url,
       image_url: imageIn || "",
@@ -75,6 +77,11 @@ export async function POST(req: Request) {
       source,
 
       enrichStatus: "pending",
+      intakeStatus: "processing", // processing | ready | needs_user_input | blocked
+      needsUserInput: false,
+      blockedReason: null,
+      parseStatus: "pending",
+      parseMissing: ["title", "image", "price.amount", "price.currency"],
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
@@ -101,7 +108,13 @@ export async function POST(req: Request) {
       // silent fail (best-effort)
     });
 
-    return NextResponse.json({ ok: true, itemId });
+    return NextResponse.json({
+      ok: true,
+      itemId,
+      intakeStatus: "processing",
+      needsUserInput: false,
+      blockedReason: null,
+    });
   } catch (e: any) {
     return NextResponse.json(
       { ok: false, error: e?.message || "Server error" },
