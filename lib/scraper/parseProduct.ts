@@ -337,48 +337,63 @@ function parseFromJsonLd(url: string, $: cheerio.CheerioAPI) {
     .map((_, el) => $(el).text())
     .get();
 
+  // First pass: collect all candidate nodes across every script so we can
+  // pick the most product-like one — not just whichever shop happens to
+  // emit first. Coolblue ships a BreadcrumbList block before the Product
+  // block, and the old loop would lock in a breadcrumb name.
+  const allNodes: any[] = [];
+  for (const raw of scripts) {
+    try {
+      const json = JSON.parse(raw);
+      allNodes.push(...flattenJsonLd(json));
+    } catch {
+      // ignore malformed JSON-LD blocks
+    }
+  }
+
+  const productNodes = allNodes.filter((n) => isType(n, "Product"));
+  const productsWithOffers = productNodes.filter((n) => !!n?.offers);
+
+  const rankedProducts = (productsWithOffers.length ? productsWithOffers : productNodes)
+    .slice()
+    .sort((a, b) => String(b?.name ?? "").length - String(a?.name ?? "").length);
+
   let title = "";
   let imageUrl = "";
   let price: number | null = null;
   let currency: string | null = null;
 
-  for (const raw of scripts) {
-    try {
-      const json = JSON.parse(raw);
-      const nodes = flattenJsonLd(json);
-      const products = nodes.filter((n) => isType(n, "Product"));
-      const candidates = products.length ? products : nodes;
+  // Pull title/image/price from the best product node first.
+  for (const n of rankedProducts) {
+    if (!title && n?.name) title = String(n.name).trim();
+    if (!imageUrl) {
+      const img = n?.image;
+      if (typeof img === "string") imageUrl = img;
+      else if (Array.isArray(img) && typeof img[0] === "string") imageUrl = img[0];
+      imageUrl = absUrl(url, imageUrl);
+    }
+    const offers = n?.offers;
+    const offer = Array.isArray(offers) ? offers[0] : offers;
+    if (price == null && offer) {
+      const p = toNumberOrNull(offer?.price ?? offer?.lowPrice ?? offer?.highPrice);
+      if (p != null) price = p;
+      const cur = offer?.priceCurrency
+        ? String(offer.priceCurrency)
+        : extractCurrencyLoose(String(offer?.price ?? ""));
+      if (!currency && cur) currency = cur;
+    }
+    if (title && imageUrl && price != null && currency) break;
+  }
 
-      for (const n of candidates) {
-        if (!title && (isType(n, "Product") || n?.name)) {
-          const name = n?.name ? String(n.name) : "";
-          if (name) title = name;
-        }
-
-        if (!imageUrl) {
-          const img = n?.image;
-          if (typeof img === "string") imageUrl = img;
-          if (Array.isArray(img) && typeof img[0] === "string") imageUrl = img[0];
-          imageUrl = absUrl(url, imageUrl);
-        }
-
-        const offers = n?.offers;
-        const offer = Array.isArray(offers) ? offers[0] : offers;
-
-        if (price == null && offer) {
-          const p = toNumberOrNull(offer?.price ?? offer?.lowPrice ?? offer?.highPrice);
-          if (p != null) price = p;
-
-          const cur = offer?.priceCurrency
-            ? String(offer.priceCurrency)
-            : extractCurrencyLoose(String(offer?.price ?? ""));
-          if (!currency && cur) currency = cur;
-        }
-
-        if (title && imageUrl && (price != null || currency)) break;
+  // Fallback: when no Product node was found, accept any named node.
+  // Skip BreadcrumbList / ItemList types that only carry navigation labels.
+  if (!title) {
+    for (const n of allNodes) {
+      if (isType(n, "BreadcrumbList") || isType(n, "ItemList") || isType(n, "ListItem")) continue;
+      if (n?.name) {
+        title = String(n.name).trim();
+        break;
       }
-    } catch {
-      // ignore malformed JSON-LD blocks
     }
   }
 
@@ -467,13 +482,14 @@ function mergeTitle(
 ) {
   const next = String(value ?? "").trim();
   if (!next) return;
-  // Bol's lobby page gives `<title>bol</title>` (3 chars) — never let
-  // a 3-char title outrank a real one regardless of confidence.
+  // Bol's lobby page gives `<title>bol</title>` (3 chars) — let real titles
+  // outrank that. Otherwise prefer first-wins at equal confidence so a
+  // breadcrumb item can't replace a Product node that was parsed earlier.
   const existing = draft.title;
   if (existing?.value) {
     const existingIsWeak = existing.value.length < 6;
-    const sameOrStronger = confidence >= existing.confidence;
-    if (!sameOrStronger && !existingIsWeak) return;
+    const strictlyStronger = confidence > existing.confidence;
+    if (!strictlyStronger && !existingIsWeak) return;
   }
   draft.title = { value: next, source, confidence };
 }
@@ -487,7 +503,7 @@ function mergeImage(
   const next = String(value ?? "").trim();
   if (!next) return;
   const existing = draft.image;
-  if (existing?.value && confidence < existing.confidence) return;
+  if (existing?.value && confidence <= existing.confidence) return;
   draft.image = { value: next, source, confidence };
 }
 
@@ -506,7 +522,7 @@ function mergePrice(
   if (
     existing?.value?.amount != null &&
     existing?.value?.currency &&
-    confidence < existing.confidence
+    confidence <= existing.confidence
   ) {
     return;
   }
