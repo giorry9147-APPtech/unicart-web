@@ -507,20 +507,59 @@ function isBlockedContent(text: string) {
   return !!detectBlockedReason(text);
 }
 
+function hasProductSignals(text: string): boolean {
+  if (/<meta[^>]+property=["']og:image["'][^>]+content=["'][^"']+["']/i.test(text)) return true;
+  if (/<script[^>]+type=["']application\/ld\+json["'][^>]*>[\s\S]*?"@type"\s*:\s*"?Product"?/i.test(text)) {
+    return true;
+  }
+  if (/<meta[^>]+(?:property|name)=["']product:price:amount["']/i.test(text)) return true;
+  if (/itemprop=["']price["']/i.test(text)) return true;
+  return false;
+}
+
 function detectBlockedReason(text: string): string | null {
-  const hay = text.toLowerCase();
-  if (hay.includes("captcha") || hay.includes("recaptcha") || hay.includes("hcaptcha")) {
+  // If the page exposes real product signals, treat as not blocked even if some
+  // page text mentions "log in" / "captcha" in unrelated places.
+  if (hasProductSignals(text)) return null;
+
+  const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const titleText = (titleMatch?.[1] || "").replace(/<[^>]+>/g, "").trim().toLowerCase();
+
+  const h1Match = text.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+  const h1Text = (h1Match?.[1] || "").replace(/<[^>]+>/g, "").trim().toLowerCase();
+
+  // Cloudflare interstitial
+  if (/^just a moment\.{0,3}$/.test(titleText) || /^just a moment\.{0,3}$/.test(h1Text)) {
     return "blocked_captcha";
   }
-  if (hay.includes("access denied") || hay.includes("forbidden")) {
-    return "blocked_access_denied";
+
+  // Captcha / human verification — only when it dominates the page
+  if (/^(captcha|recaptcha|hcaptcha|security check|please verify)$/.test(titleText)) {
+    return "blocked_captcha";
   }
-  if (hay.includes("verify you are human") || hay.includes("are you human") || hay.includes("bot detection")) {
+  if (/^(verify you are human|are you human|please verify you are human|bot detection)$/.test(titleText)) {
     return "blocked_human_verification";
   }
-  if (hay.includes("sign in") || hay.includes("log in") || hay.includes("login required")) {
+  if (/^(verify you are human|are you human|please verify you are human)$/.test(h1Text)) {
+    return "blocked_human_verification";
+  }
+
+  // Hard access blocks
+  if (/^(access denied|forbidden|403 forbidden|404 not found|page not found)$/.test(titleText)) {
+    return "blocked_access_denied";
+  }
+  if (/^(access denied|forbidden|403 forbidden)$/.test(h1Text)) {
+    return "blocked_access_denied";
+  }
+
+  // Login wall — only when the page is literally a login screen
+  if (/^(login|log in|sign in|sign-in|inloggen|aanmelden|please log in|please sign in|login required)$/.test(titleText)) {
     return "blocked_login_wall";
   }
+  if (/^(login|log in|sign in|inloggen|aanmelden|login required)$/.test(h1Text)) {
+    return "blocked_login_wall";
+  }
+
   return null;
 }
 

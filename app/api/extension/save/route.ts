@@ -52,12 +52,14 @@ export async function POST(req: Request) {
     const shopIn = String(item?.shop || "").trim();
     const imageIn = String(item?.image || item?.image_url || "").trim();
     const categoryIn = String(item?.category || "").trim();
+    const currencyIn = String(item?.currency || "").trim().toUpperCase();
     const priceIn = toNumberOrNull(item?.price);
 
     const doc: any = {
       id: itemId,
       title: titleIn || domain,
       price: priceIn,
+      currency: currencyIn || null,
       shop: shopIn || domain,
       product_url: url,
       image_url: imageIn,
