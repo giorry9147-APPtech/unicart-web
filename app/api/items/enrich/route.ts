@@ -4,6 +4,9 @@ import { adminDb } from "@/lib/firebaseAdmin";
 import * as admin from "firebase-admin";
 import { parseProductUrl } from "@/lib/scraper/parseProduct";
 
+// Same reasoning as /api/parse — playwright fallback can take 30s+
+export const maxDuration = 60;
+
 type EnrichStatus = "pending" | "ok" | "failed";
 type IntakeStatus = "processing" | "ready" | "needs_user_input" | "blocked";
 

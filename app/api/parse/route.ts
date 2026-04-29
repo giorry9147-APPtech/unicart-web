@@ -2,6 +2,10 @@
 import { NextResponse } from "next/server";
 import { parseProductUrl } from "@/lib/scraper/parseProduct";
 
+// Allow up to 60s — playwright cold-start on Fly.io can take 10-15s,
+// then a real scrape adds another 5-15s.
+export const maxDuration = 60;
+
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
