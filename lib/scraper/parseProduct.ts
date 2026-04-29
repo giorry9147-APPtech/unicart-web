@@ -465,9 +465,16 @@ function mergeTitle(
   source: string,
   confidence: number
 ) {
-  if (draft.title?.value) return;
   const next = String(value ?? "").trim();
   if (!next) return;
+  // Bol's lobby page gives `<title>bol</title>` (3 chars) — never let
+  // a 3-char title outrank a real one regardless of confidence.
+  const existing = draft.title;
+  if (existing?.value) {
+    const existingIsWeak = existing.value.length < 6;
+    const sameOrStronger = confidence >= existing.confidence;
+    if (!sameOrStronger && !existingIsWeak) return;
+  }
   draft.title = { value: next, source, confidence };
 }
 
@@ -477,9 +484,10 @@ function mergeImage(
   source: string,
   confidence: number
 ) {
-  if (draft.image?.value) return;
   const next = String(value ?? "").trim();
   if (!next) return;
+  const existing = draft.image;
+  if (existing?.value && confidence < existing.confidence) return;
   draft.image = { value: next, source, confidence };
 }
 
@@ -490,11 +498,18 @@ function mergePrice(
   source: string,
   confidence: number
 ) {
-  if (draft.price?.value?.amount != null && draft.price?.value?.currency) return;
-
   const cleanAmount = amount != null && Number.isFinite(amount) ? amount : null;
   const cleanCurrency = String(currency ?? "").trim().toUpperCase();
   if (cleanAmount == null || !cleanCurrency) return;
+
+  const existing = draft.price;
+  if (
+    existing?.value?.amount != null &&
+    existing?.value?.currency &&
+    confidence < existing.confidence
+  ) {
+    return;
+  }
 
   draft.price = {
     value: { amount: cleanAmount, currency: cleanCurrency },
