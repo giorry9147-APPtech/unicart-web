@@ -717,9 +717,12 @@ async function callPlaywrightFallback(
     let pwRes: Response | null = null;
     let lastErr: any = null;
 
-    for (let i = 0; i < 2; i++) {
+    // Single attempt with a tight budget — Vercel functions cap at 60s on
+    // hobby plan, and the parser already burns time on the initial HTML
+    // fetch + retries before reaching here. Keep playwright under 30s.
+    for (let i = 0; i < 1; i++) {
       try {
-        pwRes = await fetchWithTimeout(25000 + i * 5000);
+        pwRes = await fetchWithTimeout(28000);
         attempts.push(`attempt_${i + 1}:http_${pwRes.status}`);
         break;
       } catch (e: any) {
